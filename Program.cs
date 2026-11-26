@@ -6,6 +6,7 @@ using Microsoft.Data.Sqlite;
 var dataRoot = Path.GetFullPath(Environment.GetEnvironmentVariable("MAF_DATA") ?? Path.Combine(Directory.GetCurrentDirectory(), "data"));
 var uploadsRoot = Path.Combine(dataRoot, "uploads");
 Directory.CreateDirectory(uploadsRoot);
+var assetIoGate = new SemaphoreSlim(1, 1);
 // Snapshots from an interrupted backup must not leak into the next archive.
 foreach (var stale in Directory.EnumerateFiles(dataRoot, "library-backup-*.db*"))
 {
@@ -51,6 +52,7 @@ if (args.Contains("--check-library", StringComparer.Ordinal))
         if (Scalar("SELECT value FROM meta WHERE key = 'initialized';") != "1") failures.Add("initialized marker");
     }
 
+    var referencedAssets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     foreach (var item in data.Items)
     {
         if (string.IsNullOrWhiteSpace(item.OrderNumber) || string.IsNullOrWhiteSpace(item.ProductNumber))
@@ -61,9 +63,22 @@ if (args.Contains("--check-library", StringComparer.Ordinal))
         if (item.Number != $"{item.OrderNumber}.{item.ProductNumber}")
             failures.Add($"изделие {item.Id}: номер {item.Number} не собран из частей");
         foreach (var asset in item.Assets)
-            if (!File.Exists(Path.Combine(uploadsRoot, Path.GetFileName(asset.StoredName))))
+        {
+            var storedName = Path.GetFileName(asset.StoredName);
+            referencedAssets.Add(storedName);
+            var assetPath = Path.Combine(uploadsRoot, storedName);
+            if (!File.Exists(assetPath))
                 failures.Add($"нет файла {asset.StoredName} у изделия {item.Number}");
+            else if (new FileInfo(assetPath).Length != asset.Size)
+                failures.Add($"размер файла {asset.StoredName} не совпадает с базой");
+        }
     }
+
+    var uploadFiles = Directory.EnumerateFiles(uploadsRoot, "*", SearchOption.AllDirectories).ToArray();
+    var orphanFiles = uploadFiles.Select(file => Path.GetRelativePath(uploadsRoot, file).Replace('\\', '/'))
+        .Where(file => !referencedAssets.Contains(file)).ToArray();
+    if (orphanFiles.Length > 0) Console.WriteLine($"[MAF] check: orphan_files={orphanFiles.Length} (не используются, не удалены)");
+    Console.WriteLine($"[MAF] check: upload_files={uploadFiles.Length} referenced_assets={referencedAssets.Count}");
 
     var assets = data.Items.Sum(item => item.Assets.Count);
     Console.WriteLine($"[MAF] check: items={data.Items.Count} categories={data.Categories.Count} orders={data.Orders.Count} assets={assets}");
@@ -202,8 +217,13 @@ app.MapDelete("/api/categories/{category}", (HttpRequest request, string categor
 app.MapDelete("/api/library", (HttpRequest request) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
+    assetIoGate.Wait();
+    try
+    {
     foreach (var stored in store.Clear()) DeleteUpload(stored);
     return Results.Ok(new { cleared = true });
+    }
+    finally { assetIoGate.Release(); }
 });
 app.MapPost("/api/items", (HttpRequest request, ItemInput input) =>
 {
@@ -248,16 +268,24 @@ app.MapPut("/api/items/{id}", (HttpRequest request, string id, ItemInput input) 
 app.MapDelete("/api/items/{id}", (HttpRequest request, string id) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
+    assetIoGate.Wait();
+    try
+    {
     var stored = store.DeleteItem(id);
     if (stored is null) return Results.NotFound();
     foreach (var name in stored) DeleteUpload(name);
     return Results.Ok();
+    }
+    finally { assetIoGate.Release(); }
 });
 app.MapPost("/api/items/{id}/files", async (HttpRequest request, string id, IFormFile file) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
     if (file.Length == 0 || file.Length > 100 * 1024 * 1024) return Results.BadRequest("Файл пустой или превышает лимит 100 МБ.");
     if (store.GetItem(id) is null) return Results.NotFound();
+    await assetIoGate.WaitAsync();
+    try
+    {
 
     var name = SafeName(file.FileName);
     var ext = Path.GetExtension(name).ToLowerInvariant();
@@ -285,14 +313,21 @@ app.MapPost("/api/items/{id}/files", async (HttpRequest request, string id, IFor
     }
     foreach (var oldStored in previous) DeleteUpload(oldStored);
     return Results.Ok(asset);
+    }
+    finally { assetIoGate.Release(); }
 }).DisableAntiforgery();
 app.MapDelete("/api/items/{id}/files/{assetId}", (HttpRequest request, string id, string assetId) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
+    assetIoGate.Wait();
+    try
+    {
     var stored = store.DeleteAsset(id, assetId);
     if (stored is null) return Results.NotFound();
     DeleteUpload(stored);
     return Results.Ok();
+    }
+    finally { assetIoGate.Release(); }
 });
 app.MapGet("/files/{storedName}", (HttpContext context, string storedName) =>
 {
@@ -306,6 +341,9 @@ app.MapGet("/files/{storedName}", (HttpContext context, string storedName) =>
 app.MapPost("/api/import-json", async (HttpRequest request, IFormFile file) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
+    await assetIoGate.WaitAsync();
+    try
+    {
     using var reader = new StreamReader(file.OpenReadStream());
     var text = await reader.ReadToEndAsync();
     // Old exports may still carry Number, Type and AnalogGroup. They are checked
@@ -322,40 +360,54 @@ app.MapPost("/api/import-json", async (HttpRequest request, IFormFile file) =>
         return Results.BadRequest("В импорте есть изделия без номера заказа или номера изделия. Ничего не изменено.");
     var result = store.MergeImport(imported, uploadsRoot);
     return Results.Ok(new { read = imported.Items.Count, added = result.Added, duplicatesSkipped = result.Skipped });
+    }
+    finally { assetIoGate.Release(); }
 }).DisableAntiforgery();
-app.MapGet("/api/backup.zip", async (HttpRequest request) =>
+app.MapGet("/api/backup.zip", async (HttpContext httpContext) =>
 {
-    if (!Authorized(request)) return Results.Unauthorized();
+    if (!Authorized(httpContext.Request)) return Results.Unauthorized();
 
     var snapshotPath = Path.Combine(dataRoot, $"library-backup-{Guid.NewGuid():N}.db");
+    var archivePath = Path.Combine(dataRoot, $"library-backup-{Guid.NewGuid():N}.zip");
     try
     {
-        // One committed snapshot feeds both files in the archive, so library.db and
-        // library.json cannot disagree even if someone saves an item during the backup.
-        store.BackupTo(snapshotPath);
-        var snapshot = LibraryStore.Read(snapshotPath);
-
-        await using var memory = new MemoryStream();
-        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, true))
+        await assetIoGate.WaitAsync();
+        try
         {
-            var database = archive.CreateEntry("library.db", CompressionLevel.Fastest);
-            await using (var stream = database.Open())
-            {
-                await using var file = File.OpenRead(snapshotPath);
-                await file.CopyToAsync(stream);
-            }
+            // Keep asset rows and upload files unchanged from the DB snapshot through
+            // archive creation, and write to disk instead of retaining the ZIP in RAM.
+            store.BackupTo(snapshotPath);
+            var snapshot = LibraryStore.Read(snapshotPath);
+            var assetSizes = snapshot.Items.SelectMany(item => item.Assets)
+                .GroupBy(asset => Path.GetFileName(asset.StoredName), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.First().Size, StringComparer.OrdinalIgnoreCase);
 
-            var json = archive.CreateEntry("library.json", CompressionLevel.Fastest);
-            await using (var stream = json.Open()) await JsonSerializer.SerializeAsync(stream, snapshot, jsonOptions);
-
-            foreach (var file in Directory.EnumerateFiles(uploadsRoot, "*", SearchOption.AllDirectories))
+            using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
             {
-                var relative = Path.GetRelativePath(uploadsRoot, file).Replace('\\', '/');
-                var entry = archive.CreateEntry($"uploads/{relative}", CompressionLevel.Fastest);
-                await using var target = entry.Open(); await using var source = File.OpenRead(file); await source.CopyToAsync(target);
+                archive.CreateEntryFromFile(snapshotPath, "library.db", CompressionLevel.Fastest);
+                if (File.Exists(legacyJsonFile)) archive.CreateEntryFromFile(legacyJsonFile, "library.json.old", CompressionLevel.Fastest);
+
+                var json = archive.CreateEntry("library.json", CompressionLevel.Fastest);
+                await using (var stream = json.Open()) await JsonSerializer.SerializeAsync(stream, snapshot, jsonOptions);
+
+                foreach (var sourcePath in Directory.EnumerateFiles(uploadsRoot, "*", SearchOption.AllDirectories).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                {
+                    var relative = Path.GetRelativePath(uploadsRoot, sourcePath).Replace('\\', '/');
+                    var size = new FileInfo(sourcePath).Length;
+                    if (assetSizes.TryGetValue(relative, out var expectedSize) && size != expectedSize)
+                        throw new IOException($"Размер ассета изменился относительно снимка базы: {relative}");
+                    archive.CreateEntryFromFile(sourcePath, $"uploads/{relative}", CompressionLevel.Fastest);
+                }
             }
         }
-        return Results.File(memory.ToArray(), "application/zip", $"maf-library-backup-{DateTime.Now:yyyyMMdd-HHmmss}.zip");
+        finally { assetIoGate.Release(); }
+
+        httpContext.Response.OnCompleted(() =>
+        {
+            try { if (File.Exists(archivePath)) File.Delete(archivePath); } catch (IOException) { }
+            return Task.CompletedTask;
+        });
+        return Results.File(archivePath, "application/zip", $"maf-library-backup-{DateTime.Now:yyyyMMdd-HHmmss}.zip", enableRangeProcessing: true);
     }
     finally
     {

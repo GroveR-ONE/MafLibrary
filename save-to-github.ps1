@@ -3,24 +3,25 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
-Set-Location $root
-
 $git = Get-Command git.exe -ErrorAction SilentlyContinue
 $gitPath = $git.Source
-if (-not $git) {
+if (-not $gitPath) {
   $candidate = 'C:\Program Files\Git\cmd\git.exe'
   if (Test-Path -LiteralPath $candidate) { $gitPath = $candidate }
 }
 if (-not $gitPath) { throw 'Git for Windows is not installed or git.exe could not be found.' }
 
+$root = [IO.Path]::GetFullPath($PSScriptRoot)
+while (-not (Test-Path -LiteralPath (Join-Path $root '.git'))) {
+  $parent = Split-Path -Parent $root
+  if (-not $parent -or $parent -eq $root) { throw "Could not find a Git repository above '$PSScriptRoot'." }
+  $root = $parent
+}
+Set-Location $root
+
 function Invoke-Git {
   & $gitPath @args
   if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed with exit code $LASTEXITCODE" }
-}
-
-if (-not (Test-Path -LiteralPath (Join-Path $root '.git'))) {
-  throw 'This folder is not initialized as a Git repository. Run the one-time setup first.'
 }
 
 $branch = (& $gitPath branch --show-current).Trim()
@@ -31,6 +32,7 @@ if ($LASTEXITCODE -ne 0 -or $remote -notmatch '^https://github\.com/GroveR-ONE/M
   throw 'The origin remote is missing or is not the configured private repository GroveR-ONE/MafLibrary.'
 }
 
+Write-Host "Repository: $root" -ForegroundColor DarkGray
 Write-Host ''
 Write-Host 'Changes that will be included (data/, uploads, backups, bin and obj are excluded):' -ForegroundColor Cyan
 Invoke-Git status --short

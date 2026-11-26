@@ -35,6 +35,24 @@ foreach ($item in $response.items) {
   if ($item.number -ne $expected) { throw "Item $($item.id): number $($item.number) does not match $expected" }
 }
 
+$uploadsRoot = Join-Path $root 'data\uploads'
+$referencedFiles = @{}
+foreach ($item in $response.items) {
+  foreach ($asset in $item.assets) {
+    $stored = [IO.Path]::GetFileName([string]$asset.storedName)
+    $referencedFiles[$stored] = $true
+    $assetPath = Join-Path $uploadsRoot $stored
+    if (Test-Path -LiteralPath $assetPath) {
+      $actualSize = (Get-Item -LiteralPath $assetPath).Length
+      if ($actualSize -ne [long]$asset.size) { throw "Asset size mismatch: $stored (db=$($asset.size), file=$actualSize)" }
+    }
+  }
+}
+$uploadFiles = @(Get-ChildItem -LiteralPath $uploadsRoot -File -Recurse -ErrorAction SilentlyContinue)
+$orphans = @($uploadFiles | Where-Object { -not $referencedFiles.ContainsKey($_.Name) })
+if ($orphans.Count) { Write-Output "INFO: orphan files=$($orphans.Count); retained, not deleted" }
+Write-Output "Assets: referenced=$($referencedFiles.Count), files=$($uploadFiles.Count)"
+
 $required = @('/index.html', '/app.js', '/categories.js', '/orders.js', '/order-filter.js', '/style.css')
 foreach ($path in $required) {
   $result = Invoke-WebRequest -Uri "$base$path" -UseBasicParsing -TimeoutSec 10
@@ -43,4 +61,4 @@ foreach ($path in $required) {
 if ($response.items.Count -gt 0 -and $response.items[0].PSObject.Properties.Name -contains 'Type') {
   Write-Warning 'Legacy Type/AnalogGroup fields are still present in API responses.'
 }
-Write-Output "OK: db items=$dbItems, api items=$($response.items.Count), categories=$($response.categories.Count), orders=$($response.orders.Count)"
+Write-Output "OK: db items=$dbItems, api items=$($response.items.Count), categories=$($response.categories.Count), orders=$($response.orders.Count), assets=$($referencedFiles.Count)"
