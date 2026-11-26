@@ -59,6 +59,9 @@ try {
   foreach ($required in @('library.db','library.json','library.json.old')) {
     if (-not $hashes.Contains($required)) { throw "Required file missing from backup archive: $required" }
   }
+  if (@($hashes.Keys | Where-Object { $_ -match '^uploads/(?!\.staging/)' }).Count -ne $hashes.Count - 3) {
+    throw 'Backup contains unexpected upload paths (staging data is never backed up).'
+  }
   New-Item -ItemType Directory -Force -Path $validationData,(Join-Path $validationData 'uploads') | Out-Null
   [IO.Compression.ZipFile]::ExtractToDirectory($zipPath,$validationData)
 

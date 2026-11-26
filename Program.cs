@@ -6,7 +6,17 @@ using Microsoft.Data.Sqlite;
 var dataRoot = Path.GetFullPath(Environment.GetEnvironmentVariable("MAF_DATA") ?? Path.Combine(Directory.GetCurrentDirectory(), "data"));
 var uploadsRoot = Path.Combine(dataRoot, "uploads");
 Directory.CreateDirectory(uploadsRoot);
+var uploadTempRoot = Path.Combine(uploadsRoot, ".staging");
+Directory.CreateDirectory(uploadTempRoot);
+var staleBefore = DateTime.UtcNow.AddDays(-1);
+foreach (var stale in Directory.EnumerateFiles(uploadTempRoot, "*", SearchOption.TopDirectoryOnly)
+    .Where(path => File.GetLastWriteTimeUtc(path) < staleBefore))
+{
+    try { File.Delete(stale); } catch (IOException) { }
+}
 var assetIoGate = new SemaphoreSlim(1, 1);
+const long MaxUploadBytes = 100L * 1024 * 1024;
+const long MaxImagePixels = 40_000_000;
 // Snapshots from an interrupted backup must not leak into the next archive.
 foreach (var stale in Directory.EnumerateFiles(dataRoot, "library-backup-*.db*"))
 {
@@ -133,6 +143,184 @@ void DeleteUpload(string storedName)
 {
     var file = Path.Combine(uploadsRoot, Path.GetFileName(storedName));
     if (File.Exists(file)) File.Delete(file);
+}
+
+string? UploadSpaceError(long requiredBytes)
+{
+    try
+    {
+        var drive = new DriveInfo(Path.GetPathRoot(uploadsRoot)!);
+        var reserveBytes = 256L * 1024 * 1024;
+        if (drive.AvailableFreeSpace < requiredBytes + reserveBytes)
+            return $"Недостаточно места на диске для безопасной загрузки. Свободно: {drive.AvailableFreeSpace / 1024 / 1024} МБ.";
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+    {
+        return "Не удалось проверить свободное место на диске. Загрузка отменена.";
+    }
+    return null;
+}
+
+async Task<(string? Error, string Extension, string Kind, long Size, string TempPath)> StageUploadAsync(IFormFile file, CancellationToken cancellationToken)
+{
+    if (file.Length <= 0 || file.Length > MaxUploadBytes)
+        return ("Файл пустой или превышает лимит 100 МБ.", "", "", 0, "");
+    if (file.Length > int.MaxValue)
+        return ("Файл слишком большой для обработки.", "", "", 0, "");
+
+    var safeName = SafeName(file.FileName);
+    var claimedExtension = Path.GetExtension(safeName).ToLowerInvariant();
+    var ext = claimedExtension;
+    var kind = "";
+    var tempPath = Path.Combine(uploadTempRoot, Guid.NewGuid().ToString("N") + ".upload");
+    var spaceError = UploadSpaceError(file.Length);
+    if (spaceError is not null) return (spaceError, "", "", 0, "");
+    var keepStagedFile = false;
+
+    try
+    {
+        await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            await file.CopyToAsync(output, cancellationToken);
+            await output.FlushAsync(cancellationToken);
+            output.Flush(true);
+        }
+
+        var actualSize = new FileInfo(tempPath).Length;
+        if (actualSize != file.Length) return ("Размер принятого файла не совпадает с исходным. Загрузка отменена.", "", "", 0, "");
+
+        var prefix = new byte[Math.Min(512, checked((int)actualSize))];
+        await using (var input = new FileStream(tempPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await input.ReadExactlyAsync(prefix, cancellationToken);
+
+        if (prefix.Length >= 8 && prefix[0] == 0x89 && prefix.AsSpan(1, 7).SequenceEqual("PNG\r\n\x1a\n"u8)) { ext = ".png"; kind = "image"; }
+        else if (prefix.Length >= 3 && prefix[0] == 0xff && prefix[1] == 0xd8 && prefix[2] == 0xff) { ext = ".jpg"; kind = "image"; }
+        else if (prefix.AsSpan().StartsWith("GIF87a"u8) || prefix.AsSpan().StartsWith("GIF89a"u8)) { ext = ".gif"; kind = "image"; }
+        else if (prefix.Length >= 12 && prefix.AsSpan(0, 4).SequenceEqual("RIFF"u8) && prefix.AsSpan(8, 4).SequenceEqual("WEBP"u8)) { ext = ".webp"; kind = "image"; }
+        else if (prefix.AsSpan().StartsWith("%PDF-"u8)) { ext = ".pdf"; kind = "drawing"; }
+        else if (claimedExtension is ".html" or ".htm" && LooksLikeHtml(prefix)) { ext = claimedExtension; kind = "model"; }
+        else return ("Тип содержимого не распознан или не соответствует поддерживаемым файлам: PNG, JPG, WEBP, GIF, PDF, HTML.", "", "", 0, "");
+
+        if (kind == "image" && !new[] { ".png", ".jpg", ".jpeg", ".webp", ".gif" }.Contains(claimedExtension, StringComparer.OrdinalIgnoreCase))
+            return ("Расширение имени не соответствует содержимому изображения.", "", "", 0, "");
+        if (kind == "drawing" && claimedExtension != ".pdf")
+            return ("Расширение имени не соответствует содержимому PDF.", "", "", 0, "");
+
+        if (kind == "image")
+        {
+            if (!TryReadRasterDimensions(tempPath, ext, out var width, out var height))
+                return ("Не удалось проверить размеры изображения. Файл повреждён или имеет неподдерживаемую кодировку.", "", "", 0, "");
+            if ((long)width * height > MaxImagePixels)
+                return ("Изображение слишком большое: максимум 40 мегапикселей.", "", "", 0, "");
+        }
+
+        keepStagedFile = true;
+        return (null, ext, kind, actualSize, tempPath);
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+        throw;
+    }
+    catch (IOException)
+    {
+        return ("Не удалось записать временный файл. Проверьте свободное место и права доступа.", "", "", 0, "");
+    }
+    finally
+    {
+        if (!keepStagedFile && File.Exists(tempPath)) File.Delete(tempPath);
+    }
+}
+
+static bool LooksLikeHtml(ReadOnlySpan<byte> bytes)
+{
+    var text = System.Text.Encoding.UTF8.GetString(bytes).TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
+    return text.StartsWith("<!doctype html", StringComparison.OrdinalIgnoreCase)
+        || text.StartsWith("<html", StringComparison.OrdinalIgnoreCase)
+        || text.StartsWith("<head", StringComparison.OrdinalIgnoreCase)
+        || text.StartsWith("<body", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool TryReadRasterDimensions(string path, string extension, out int width, out int height)
+{
+    width = 0;
+    height = 0;
+    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 16 * 1024, FileOptions.SequentialScan);
+    Span<byte> header = stackalloc byte[32];
+
+    if (extension == ".png")
+    {
+        if (stream.Read(header[..24]) != 24) return false;
+        width = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(header.Slice(16, 4));
+        height = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(header.Slice(20, 4));
+        return width > 0 && height > 0;
+    }
+
+    if (extension == ".gif")
+    {
+        if (stream.Read(header[..10]) != 10) return false;
+        width = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(6, 2));
+        height = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(8, 2));
+        return width > 0 && height > 0;
+    }
+
+    if (extension == ".webp")
+    {
+        if (stream.Read(header[..30]) < 30) return false;
+        var chunk = System.Text.Encoding.ASCII.GetString(header.Slice(12, 4));
+        if (chunk == "VP8X")
+        {
+            width = 1 + header[24] + (header[25] << 8) + (header[26] << 16);
+            height = 1 + header[27] + (header[28] << 8) + (header[29] << 16);
+            return width > 0 && height > 0;
+        }
+        if (chunk == "VP8L" && header[20] == 0x2f)
+        {
+            width = 1 + header[21] + ((header[22] & 0x3f) << 8);
+            height = 1 + (header[22] >> 6) + (header[23] << 2) + ((header[24] & 0x0f) << 10);
+            return width > 0 && height > 0;
+        }
+        if (chunk == "VP8 " && header[23] == 0x9d && header[24] == 0x01 && header[25] == 0x2a)
+        {
+            width = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(26, 2)) & 0x3fff;
+            height = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(header.Slice(28, 2)) & 0x3fff;
+            return width > 0 && height > 0;
+        }
+        return false;
+    }
+
+    if (extension != ".jpg") return false;
+    stream.Position = 2;
+    var markerBytes = new byte[2];
+    var scanned = 0;
+    while (scanned < 1024 * 1024 && stream.Read(markerBytes, 0, 1) == 1)
+    {
+        scanned++;
+        if (markerBytes[0] != 0xff) continue;
+        do
+        {
+            if (stream.Read(markerBytes, 1, 1) != 1) return false;
+            scanned++;
+        } while (markerBytes[1] == 0xff && scanned < 1024 * 1024);
+
+        var marker = markerBytes[1];
+        if (marker is 0xd8 or 0xd9 or 0x01 or >= 0xd0 and <= 0xd7) continue;
+        if (marker == 0xda) return false;
+        if (stream.Read(markerBytes, 0, 2) != 2) return false;
+        scanned += 2;
+        var segmentLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(markerBytes);
+        if (segmentLength < 2) return false;
+        if (marker is 0xc0 or 0xc1 or 0xc2 or 0xc3 or 0xc5 or 0xc6 or 0xc7 or 0xc9 or 0xca or 0xcb or 0xcd or 0xce or 0xcf)
+        {
+            if (stream.Read(header[..5]) != 5) return false;
+            height = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(header.Slice(1, 2));
+            width = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(header.Slice(3, 2));
+            return width > 0 && height > 0;
+        }
+        var skip = segmentLength - 2;
+        stream.Seek(skip, SeekOrigin.Current);
+        scanned += skip;
+    }
+    return false;
 }
 
 app.UseDefaultFiles();
@@ -281,20 +469,37 @@ app.MapDelete("/api/items/{id}", (HttpRequest request, string id) =>
 app.MapPost("/api/items/{id}/files", async (HttpRequest request, string id, IFormFile file) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
-    if (file.Length == 0 || file.Length > 100 * 1024 * 1024) return Results.BadRequest("Файл пустой или превышает лимит 100 МБ.");
     if (store.GetItem(id) is null) return Results.NotFound();
     await assetIoGate.WaitAsync();
     try
     {
+        var staged = await StageUploadAsync(file, request.HttpContext.RequestAborted);
+    if (staged.Error is not null)
+    {
+        if (staged.Error.StartsWith("Недостаточно места", StringComparison.OrdinalIgnoreCase)
+            || staged.Error.StartsWith("Не удалось проверить свободное место", StringComparison.OrdinalIgnoreCase)
+            || staged.Error.StartsWith("Не удалось записать временный файл", StringComparison.OrdinalIgnoreCase))
+            return Results.Problem(staged.Error, statusCode: StatusCodes.Status507InsufficientStorage);
+        return Results.BadRequest(staged.Error);
+    }
 
     var name = SafeName(file.FileName);
-    var ext = Path.GetExtension(name).ToLowerInvariant();
-    var kind = ext switch { ".html" or ".htm" => "model", ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif" => "image", ".pdf" => "drawing", _ => "document" };
+    var ext = staged.Extension;
+    var kind = staged.Kind;
     var stored = Guid.NewGuid().ToString("N") + ext;
     var path = Path.Combine(uploadsRoot, stored);
-    await using (var stream = File.Create(path)) await file.CopyToAsync(stream);
+    try
+    {
+        // Staging and final paths share the same volume, so rename is atomic.
+        File.Move(staged.TempPath, path);
+    }
+    catch (IOException)
+    {
+        if (File.Exists(staged.TempPath)) File.Delete(staged.TempPath);
+        return Results.Problem("Не удалось завершить загрузку файла. Проверьте свободное место и права доступа.", statusCode: StatusCodes.Status507InsufficientStorage);
+    }
 
-    var asset = new Asset { Id = Guid.NewGuid().ToString("N"), Name = name, StoredName = stored, Kind = kind, Size = file.Length };
+    var asset = new Asset { Id = Guid.NewGuid().ToString("N"), Name = name, StoredName = stored, Kind = kind, Size = staged.Size };
     string? replaceKind = kind is "image" or "drawing" or "model" ? kind : null;
     List<string>? previous;
     try
@@ -306,13 +511,9 @@ app.MapPost("/api/items/{id}/files", async (HttpRequest request, string id, IFor
         if (File.Exists(path)) File.Delete(path);
         throw;
     }
-    if (previous is null)
-    {
-        if (File.Exists(path)) File.Delete(path);
-        return Results.NotFound();
-    }
+    if (previous is null) { if (File.Exists(path)) File.Delete(path); return Results.NotFound(); }
     foreach (var oldStored in previous) DeleteUpload(oldStored);
-    return Results.Ok(asset);
+    return Results.Ok(new { asset.Id, asset.Name, asset.StoredName, asset.Kind, asset.Size, originalName = name });
     }
     finally { assetIoGate.Release(); }
 }).DisableAntiforgery();
@@ -390,7 +591,9 @@ app.MapGet("/api/backup.zip", async (HttpContext httpContext) =>
                 var json = archive.CreateEntry("library.json", CompressionLevel.Fastest);
                 await using (var stream = json.Open()) await JsonSerializer.SerializeAsync(stream, snapshot, jsonOptions);
 
-                foreach (var sourcePath in Directory.EnumerateFiles(uploadsRoot, "*", SearchOption.AllDirectories).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                foreach (var sourcePath in Directory.EnumerateFiles(uploadsRoot, "*", SearchOption.AllDirectories)
+                    .Where(path => !Path.GetRelativePath(uploadsRoot, path).StartsWith(".staging\\", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
                 {
                     var relative = Path.GetRelativePath(uploadsRoot, sourcePath).Replace('\\', '/');
                     var size = new FileInfo(sourcePath).Length;

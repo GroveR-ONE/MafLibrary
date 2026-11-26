@@ -42,14 +42,15 @@ foreach ($item in $response.items) {
     $stored = [IO.Path]::GetFileName([string]$asset.storedName)
     $referencedFiles[$stored] = $true
     $assetPath = Join-Path $uploadsRoot $stored
-    if (Test-Path -LiteralPath $assetPath) {
+    if (-not (Test-Path -LiteralPath $assetPath)) { throw "Missing referenced asset: $stored" }
+    else {
       $actualSize = (Get-Item -LiteralPath $assetPath).Length
       if ($actualSize -ne [long]$asset.size) { throw "Asset size mismatch: $stored (db=$($asset.size), file=$actualSize)" }
     }
   }
 }
 $uploadFiles = @(Get-ChildItem -LiteralPath $uploadsRoot -File -Recurse -ErrorAction SilentlyContinue)
-$orphans = @($uploadFiles | Where-Object { -not $referencedFiles.ContainsKey($_.Name) })
+$orphans = @($uploadFiles | Where-Object { $_.FullName -notmatch '\\\.staging\\' -and -not $referencedFiles.ContainsKey($_.Name) })
 if ($orphans.Count) { Write-Output "INFO: orphan files=$($orphans.Count); retained, not deleted" }
 Write-Output "Assets: referenced=$($referencedFiles.Count), files=$($uploadFiles.Count)"
 
