@@ -10,9 +10,9 @@
 2. Задайте PIN для режима редактирования (рекомендуется сменить начальный `admin`). Например, в PowerShell:
 
    ```powershell
-$env:MAF_ADMIN_PIN = 'ваш-общий-pin'
-cd C:\Users\Konst2\Documents\MafLibrary
-.\start-library.bat
+   cd C:\Users\Konst2\Documents\MafLibrary
+   $env:MAF_ADMIN_PIN = 'ваш-общий-pin'
+   .\start-library.bat
    ```
 
 3. Если переменную не задавать, PIN — `admin`. Сервер слушает порт `5080` на всех сетевых интерфейсах.
