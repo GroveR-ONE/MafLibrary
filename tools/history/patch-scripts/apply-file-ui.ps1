@@ -1,0 +1,19 @@
+$path = Resolve-Path 'wwwroot/app.js'
+$s = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
+$pattern = @'
+(?s)<div class="field wide"><label>[^<]*</label><input name="renderFile".*?</div><div class="field"><label>[^<]*</label><input name="drawingFile".*?</div><div class="field"><label>[^<]*</label><input name="modelFile".*?</div>
+'@
+$replacement = @'
+<div class="field wide"><label>\u041a\u0430\u0440\u0442\u0438\u043d\u043a\u0430-\u0440\u0435\u043d\u0434\u0435\u0440 ${item?'(\u0437\u0430\u043c\u0435\u043d\u0430 \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e)':'*'}</label>${item?.assets?.find(a=>a.kind==='image')?`<div class="file-current">\u2713 \u0417\u0430\u0433\u0440\u0443\u0436\u0435\u043d: <b>${esc(item.assets.find(a=>a.kind==='image').name)}</b></div>`:''}<input name="renderFile" type="file" accept="image/*"><small class="file-replace-note hidden" data-for="renderFile">\u041d\u043e\u0432\u044b\u0439 \u0444\u0430\u0439\u043b \u0437\u0430\u043c\u0435\u043d\u0438\u0442 \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u0440\u0435\u043d\u0434\u0435\u0440</small></div><div class="field"><label>\u0427\u0435\u0440\u0442\u0451\u0436 PDF ${item?'(\u0437\u0430\u043c\u0435\u043d\u0430 \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e)':''}</label>${item?.assets?.find(a=>a.kind==='drawing')?`<div class="file-current">\u2713 \u0417\u0430\u0433\u0440\u0443\u0436\u0435\u043d: <b>${esc(item.assets.find(a=>a.kind==='drawing').name)}</b></div>`:''}<input name="drawingFile" type="file" accept="application/pdf,.pdf"><small class="file-replace-note hidden" data-for="drawingFile">\u041d\u043e\u0432\u044b\u0439 \u0444\u0430\u0439\u043b \u0437\u0430\u043c\u0435\u043d\u0438\u0442 \u0442\u0435\u043a\u0443\u0449\u0438\u0439 PDF</small></div><div class="field"><label>HTML-\u043c\u043e\u0434\u0435\u043b\u044c ${item?'(\u0437\u0430\u043c\u0435\u043d\u0430 \u0442\u0435\u043a\u0443\u0449\u0435\u0439)':''}</label>${item?.assets?.find(a=>a.kind==='model')?`<div class="file-current">\u2713 \u0417\u0430\u0433\u0440\u0443\u0436\u0435\u043d: <b>${esc(item.assets.find(a=>a.kind==='model').name)}</b></div>`:''}<input name="modelFile" type="file" accept="text/html,.html,.htm"><small class="file-replace-note hidden" data-for="modelFile">\u041d\u043e\u0432\u044b\u0439 \u0444\u0430\u0439\u043b \u0437\u0430\u043c\u0435\u043d\u0438\u0442 \u0442\u0435\u043a\u0443\u0449\u0443\u044e 3D-\u043c\u043e\u0434\u0435\u043b\u044c</small></div>
+'@
+$rx = [regex]::new($pattern.Trim(), [Text.RegularExpressions.RegexOptions]::Singleline)
+if (-not $rx.IsMatch($s)) { throw 'file fields pattern not found' }
+$s = $rx.Replace($s, $replacement.Trim(), 1)
+$hook = @'
+$('#cancelEdit').onclick=closeModal;$('#saveItem').onclick=
+'@
+$hookReplacement = @'
+['renderFile','drawingFile','modelFile'].forEach(name=>{const input=$(`[name="${name}"]`),note=$(`[data-for="${name}"]`);input?.addEventListener('change',()=>note?.classList.toggle('hidden',!input.files.length))});$('#cancelEdit').onclick=closeModal;$('#saveItem').onclick=
+'@
+$s = $s.Replace($hook.Trim(), $hookReplacement.Trim())
+[IO.File]::WriteAllText($path, $s, [Text.UTF8Encoding]::new($false))
