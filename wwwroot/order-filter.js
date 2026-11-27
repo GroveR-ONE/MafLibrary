@@ -5,7 +5,8 @@
   function draw() {
     const nav = document.querySelector('#orderNav');
     if (!nav) return;
-    nav.innerHTML = (window.__orders || []).map(o => `<button class="category-link ${activeOrder === o.number ? 'active' : ''}" data-order-filter="${esc(o.number)}"><span class="cat-dot order-dot"></span>${esc(o.number)}${o.parkName ? ' - ' + esc(o.parkName) : ''}<span class="cat-count">${items.filter(x => x.orderNumber === o.number).length}</span></button>`).join('');
+    const query = document.querySelector('#orderSearch')?.value.trim().toLocaleLowerCase('ru') || '';
+    nav.innerHTML = (window.__orders || []).filter(o => `${o.number} ${o.parkName || ''}`.toLocaleLowerCase('ru').includes(query)).map(o => `<button class="category-link ${activeOrder === o.number ? 'active' : ''}" data-order-filter="${esc(o.number)}"><span class="cat-dot order-dot"></span>${esc(o.number)}${o.parkName ? ' - ' + esc(o.parkName) : ''}<span class="cat-count">${items.filter(x => x.orderNumber === o.number).length}</span></button>`).join('');
   }
   document.addEventListener('click', event => {
     const button = event.target.closest('[data-order-filter]');
@@ -18,5 +19,6 @@
     if (window.matchMedia('(max-width: 720px)').matches) window.closeMobileNav?.();
   });
   window.addEventListener('maf:catalog-rendered', draw);
+  document.querySelector('#orderSearch')?.addEventListener('input', draw);
   draw();
 })();

@@ -85,6 +85,23 @@
   .order-add .button{grid-column:1/-1}
   .setting-card{min-width:0;overflow-wrap:anywhere}
 }
+
+/* Sidebar dictionary searches and quiet, consistent scrollbars. */
+.nav-search{height:30px;flex:0 0 30px;display:flex;align-items:center;gap:6px;margin:0 2px 6px;padding:0 8px;border:1px solid #e7eae3;border-radius:6px;background:#fbfcf9;color:#9a9f95}
+.nav-search span{font-size:15px;line-height:1}
+.nav-search input{width:100%;min-width:0;border:0;outline:0;background:transparent;color:#586054;font:10px var(--sans)}
+.nav-search input::placeholder{color:#a4a89f}
+.nav-search:focus-within{border-color:#bcc9b7}
+.category-list,.modal,.product-detail-modal .modal-content,.modal-backdrop{scrollbar-width:thin;scrollbar-color:#c9cdc5 transparent;scrollbar-gutter:stable}
+*::-webkit-scrollbar{width:7px;height:7px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:#c9cdc5;border:2px solid transparent;border-radius:8px;background-clip:padding-box}
+*::-webkit-scrollbar-thumb:hover{background:#aeb4aa;border:2px solid transparent;background-clip:padding-box}
+body.modal-open{position:fixed;inset:0;width:100%;overflow:hidden;overscroll-behavior:none}
+body.modal-open .modal-backdrop{position:fixed;inset:0;overflow:hidden;overscroll-behavior:contain}
+.product-detail-modal{display:flex;flex-direction:column;overflow:hidden;overscroll-behavior:contain}
+.product-detail-modal .modal-content{flex:1 1 auto;min-height:0;max-height:calc(90vh - 72px);overflow-y:auto;overscroll-behavior:contain;touch-action:pan-y}
+@media(max-width:720px){.nav-search{margin-left:3px;margin-right:3px}.product-detail-modal{max-height:calc(100dvh - 24px)}.product-detail-modal .modal-content{max-height:calc(100dvh - 90px)}}
 @media(max-width:390px){
   .topbar{padding:0 8px;gap:7px}
   .top-actions{gap:4px}
