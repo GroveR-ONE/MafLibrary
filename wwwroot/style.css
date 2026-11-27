@@ -88,6 +88,20 @@
 
 /* Sidebar dictionary searches and quiet, consistent scrollbars. */
 .nav-search{height:30px;flex:0 0 30px;display:flex;align-items:center;gap:6px;margin:0 2px 6px;padding:0 8px;border:1px solid #e7eae3;border-radius:6px;background:#fbfcf9;color:#9a9f95}
+.public-view #editButton,.public-view #settingsButton,.public-view #addCategory,.public-view #addOrder,.public-view #addProduct,.private-view #editLabel{display:none!important}
+.public-view #allNav{pointer-events:none}
+.public-view .public-assets{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;padding-top:8px;border-top:1px solid var(--line)}
+.public-view .public-assets .button{padding:6px 8px;max-width:100%;overflow-wrap:anywhere;font-size:10px;text-decoration:none}
+.public-view .public-product-card{cursor:pointer}
+.public-view .public-product-card:focus-visible{outline:2px solid #8da88a;outline-offset:2px}
+.public-modal-open{position:fixed;inset:0;width:100%;overflow:hidden;overscroll-behavior:none}
+.public-modal-open .public-detail-backdrop{position:fixed;inset:0;overflow:hidden;overscroll-behavior:contain}
+.public-detail-assets{margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+.public-detail-assets .section-label{margin-bottom:10px}
+.public-pdf-viewer{min-height:360px;height:min(70vh,720px);padding:16px 44px;background:#f7f8f5}
+.public-pdf-viewer canvas{max-width:100%;max-height:100%;object-fit:contain;background:#fff;box-shadow:0 4px 16px #26332618}
+.public-pdf-status{padding:8px 12px;text-align:center;color:var(--muted);font-size:10px;background:#f6f7f3}
+@media(max-width:720px){.product-detail-modal .public-pdf-viewer{height:55dvh;min-height:260px;padding:12px 36px}}
 .nav-search span{font-size:15px;line-height:1}
 .nav-search input{width:100%;min-width:0;border:0;outline:0;background:transparent;color:#586054;font:10px var(--sans)}
 .nav-search input::placeholder{color:#a4a89f}

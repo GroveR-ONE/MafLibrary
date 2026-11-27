@@ -3,6 +3,7 @@
 // implementation cannot change the API shape.
 
 record PinRequest(string Pin);
+record LoginRequest(string Username, string Password);
 record CategoryRequest(string Category);
 record ItemInput(string Category, string OrderNumber, string ProductNumber, string Name, string Notes, string Dimensions, string SourcePath);
 record OrderInput(string Number, string Name);

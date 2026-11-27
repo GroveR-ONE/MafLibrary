@@ -1,6 +1,8 @@
 using System.IO.Compression;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+using System.Collections.Concurrent;
 using Microsoft.Data.Sqlite;
 
 var dataRoot = Path.GetFullPath(Environment.GetEnvironmentVariable("MAF_DATA") ?? Path.Combine(Directory.GetCurrentDirectory(), "data"));
@@ -109,6 +111,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls(urls);
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 110 * 1024 * 1024);
 var app = builder.Build();
+app.Use(async (context, next) =>
+{
+    context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    context.Response.Headers["Referrer-Policy"] = "no-referrer";
+    context.Response.Headers["X-Frame-Options"] = "SAMEORIGIN";
+    context.Response.Headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
+    await next();
+});
 
 Console.WriteLine($"[MAF] Listening: {urls}");
 foreach (var address in System.Net.Dns.GetHostAddresses(System.Net.Dns.GetHostName()).Where(item => item.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(item)))
@@ -116,6 +126,11 @@ foreach (var address in System.Net.Dns.GetHostAddresses(System.Net.Dns.GetHostNa
 
 var pin = Environment.GetEnvironmentVariable("MAF_ADMIN_PIN") ?? "admin";
 var jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, WriteIndented = true };
+var usersFile = Environment.GetEnvironmentVariable("MAF_USERS_FILE")
+    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "MafLibrary", "users.json");
+var users = LoadWebUsers(usersFile);
+var sessions = new ConcurrentDictionary<string, (string User, DateTime ExpiresUtc)>(StringComparer.Ordinal);
+var loginFailures = new ConcurrentDictionary<string, (int Count, DateTime WindowStartUtc)>(StringComparer.Ordinal);
 
 LibraryStore store;
 try
@@ -323,7 +338,108 @@ static bool TryReadRasterDimensions(string path, string extension, out int width
     return false;
 }
 
-app.UseDefaultFiles();
+app.Use(async (context, next) =>
+{
+    var path = context.Request.Path;
+    var isLoginApi = path.Equals("/api/session/login", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/api/session/logout", StringComparison.OrdinalIgnoreCase);
+    var isPublicApi = path.Equals("/api/public/library", StringComparison.OrdinalIgnoreCase);
+    var isPrivateStatic = path.Equals("/library.html", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/private-scripts")
+        || path.Equals("/app.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/orders.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/categories.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/order-filter.js", StringComparison.OrdinalIgnoreCase);
+    var isInternal = path.Equals("/library.html", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/app.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/orders.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/categories.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/order-filter.js", StringComparison.OrdinalIgnoreCase);
+    var isPublicPage = path.Equals("/", StringComparison.Ordinal) || path.Equals("/index.html", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/style.css", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/public.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/pdfjs/pdf.min.mjs", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/pdfjs/pdf.worker.min.mjs", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/login.html", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/fonts");
+    var isPrivate = !isPublicPage && (path.Equals("/library", StringComparison.OrdinalIgnoreCase)
+        || isPrivateStatic
+        || path.Equals("/api/session/me", StringComparison.OrdinalIgnoreCase)
+        || path.StartsWithSegments("/files")
+        || path.StartsWithSegments("/api") && !isLoginApi && !isPublicApi);
+    var staticCookie = context.Request.Cookies["maf-session"];
+    if ((isInternal || isPrivateStatic && path.StartsWithSegments("/private-scripts"))
+        && (staticCookie is null || !sessions.TryGetValue(staticCookie, out var staticUser) || staticUser.ExpiresUtc <= DateTime.UtcNow))
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return;
+    }
+    if (!isPrivate)
+    {
+        if (path.Equals("/api/session/me", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return;
+        }
+        if (path.Equals("/", StringComparison.Ordinal) || path.Equals("/index.html", StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.ContentType = "text/html; charset=utf-8";
+            await context.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath!, "index.html"));
+            return;
+        }
+        await next();
+        return;
+    }
+
+    var token = context.Request.Cookies["maf-session"];
+    if (token is not null && sessions.TryGetValue(token, out var session) && session.ExpiresUtc > DateTime.UtcNow)
+    {
+        context.Items["maf-user"] = session.User;
+        await next();
+        return;
+    }
+    if (token is not null) sessions.TryRemove(token, out _);
+
+    if (HttpMethods.IsPost(context.Request.Method) || HttpMethods.IsPut(context.Request.Method) || HttpMethods.IsDelete(context.Request.Method) || HttpMethods.IsPatch(context.Request.Method))
+    {
+        var origin = context.Request.Headers.Origin.ToString();
+        if (!string.IsNullOrWhiteSpace(origin) && Uri.TryCreate(origin, UriKind.Absolute, out var originUri)
+            && !originUri.Authority.Equals(context.Request.Host.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return;
+        }
+    }
+
+    if (path.Equals("/library", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.Redirect("/login.html", permanent: false);
+        return;
+    }
+    if (path.Equals("/login.html", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.ContentType = "text/html; charset=utf-8";
+        await context.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath!, "login.html"));
+        return;
+    }
+    if (path.Equals("/app.js", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.ContentType = "text/javascript; charset=utf-8";
+        await context.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath!, "app.js"));
+        return;
+    }
+    if (path.Equals("/orders.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/categories.js", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("/order-filter.js", StringComparison.OrdinalIgnoreCase))
+    {
+        context.Response.ContentType = "text/javascript; charset=utf-8";
+        await context.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath!, path.Value!.TrimStart('/')));
+        return;
+    }
+    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+    await context.Response.WriteAsJsonAsync(new { error = "Требуется вход в полную библиотеку." });
+});
 app.UseStaticFiles();
 app.Use(async (context, next) =>
 {
@@ -335,8 +451,86 @@ app.Use(async (context, next) =>
     await next();
 });
 
+app.MapGet("/api/public/library", () =>
+{
+    var data = store.Load();
+    var output = Results.Json(new
+    {
+        data.Categories,
+        data.Orders,
+        Items = data.Items.Select(item => new
+        {
+            item.Id, item.Number, item.Category, item.OrderNumber, item.ProductNumber,
+            item.Name, item.Dimensions, item.Notes,
+            Assets = item.Assets.Select(asset => new { asset.Id, asset.Name, asset.Kind, asset.Size, Url = $"/public-files/{Uri.EscapeDataString(Path.GetFileName(asset.StoredName))}" })
+        })
+    }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    return output;
+});
+app.MapGet("/public-files/{storedName}", (HttpContext context, string storedName) => ServeAsset(context, storedName));
 app.MapGet("/api/library", () => Results.Ok(store.Load()));
-app.MapPost("/api/auth", (PinRequest request) => request.Pin == pin ? Results.Ok(new { ok = true }) : Results.Unauthorized());
+app.MapPost("/api/auth", (HttpRequest request, PinRequest authRequest) =>
+{
+    if (request.HttpContext.Items["maf-user"] is null) return Results.Unauthorized();
+    return authRequest.Pin == pin ? Results.Ok(new { ok = true }) : Results.Unauthorized();
+});
+app.MapGet("/private-scripts/{name}", (HttpContext context, string name) =>
+{
+    var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "app.js", "orders.js", "categories.js", "order-filter.js" };
+    if (!allowed.Contains(name)) return Results.NotFound();
+    var token = context.Request.Cookies["maf-session"];
+    if (token is null || !sessions.TryGetValue(token, out var session) || session.ExpiresUtc <= DateTime.UtcNow) return Results.Unauthorized();
+    return Results.File(Path.Combine(app.Environment.WebRootPath!, name), "text/javascript; charset=utf-8");
+});
+app.MapPost("/api/session/login", async (HttpContext context, LoginRequest request) =>
+{
+    if (users.Count == 0) return Results.Problem("Персональные учётные записи не настроены на сервере.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password) || request.Username.Length > 64 || request.Password.Length > 1024)
+        return Results.Unauthorized();
+    var remote = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    var now = DateTime.UtcNow;
+    var failures = loginFailures.GetOrAdd(remote, _ => (0, now));
+    if (now - failures.WindowStartUtc > TimeSpan.FromMinutes(15)) failures = (0, now);
+    if (failures.Count >= 10) return Results.StatusCode(StatusCodes.Status429TooManyRequests);
+
+    if (!users.TryGetValue(request.Username ?? "", out var user) || !VerifyPassword(request.Password ?? "", user.PasswordHash))
+    {
+        loginFailures[remote] = (failures.Count + 1, failures.WindowStartUtc);
+        return Results.Unauthorized();
+    }
+    loginFailures.TryRemove(remote, out _);
+    var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    sessions[token] = (user.Username, now.AddHours(8));
+    context.Response.Cookies.Append("maf-session", token, new CookieOptions
+    {
+        HttpOnly = true, Secure = context.Request.IsHttps, SameSite = SameSiteMode.Strict,
+        Path = "/", MaxAge = TimeSpan.FromHours(8), IsEssential = true
+    });
+    return Results.Ok(new { ok = true });
+}).DisableAntiforgery();
+app.MapPost("/api/session/logout", (HttpContext context) =>
+{
+    var token = context.Request.Cookies["maf-session"];
+    if (token is not null) sessions.TryRemove(token, out _);
+    context.Response.Cookies.Delete("maf-session", new CookieOptions { Path = "/", SameSite = SameSiteMode.Strict, Secure = context.Request.IsHttps, HttpOnly = true });
+    return Results.Ok(new { ok = true });
+});
+app.MapGet("/api/session/me", (HttpContext context) => context.Items["maf-user"] is string username ? Results.Ok(new { username }) : Results.Unauthorized());
+app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/library", (HttpContext context) => Results.File(Path.Combine(app.Environment.WebRootPath!, "library.html"), "text/html; charset=utf-8"));
+IResult ServeAsset(HttpContext context, string storedName)
+{
+    var path = Path.Combine(uploadsRoot, Path.GetFileName(storedName));
+    if (!File.Exists(path)) return Results.NotFound();
+    var ext = Path.GetExtension(path).ToLowerInvariant();
+    var contentType = ext is ".html" or ".htm" ? "text/html; charset=utf-8" : ext switch { ".png" => "image/png", ".jpg" or ".jpeg" => "image/jpeg", ".webp" => "image/webp", ".gif" => "image/gif", ".pdf" => "application/pdf", _ => "application/octet-stream" };
+    context.Response.Headers.XContentTypeOptions = "nosniff";
+    context.Response.Headers["Referrer-Policy"] = "no-referrer";
+    context.Response.Headers.CacheControl = "public, max-age=300";
+    context.Response.Headers.ContentDisposition = "inline";
+    if (ext is ".html" or ".htm") context.Response.Headers.ContentSecurityPolicy = "sandbox allow-scripts allow-forms; default-src data: blob: 'unsafe-inline' 'unsafe-eval'; img-src data: blob:; style-src data: blob: 'unsafe-inline'; font-src data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+    return Results.File(path, contentType, enableRangeProcessing: true);
+}
 app.MapPost("/api/categories", (HttpRequest request, CategoryRequest input) =>
 {
     if (!Authorized(request)) return Results.Unauthorized();
@@ -532,12 +726,7 @@ app.MapDelete("/api/items/{id}/files/{assetId}", (HttpRequest request, string id
 });
 app.MapGet("/files/{storedName}", (HttpContext context, string storedName) =>
 {
-    var path = Path.Combine(uploadsRoot, Path.GetFileName(storedName));
-    if (!File.Exists(path)) return Results.NotFound();
-    var ext = Path.GetExtension(path).ToLowerInvariant();
-    var contentType = ext is ".html" or ".htm" ? "text/html; charset=utf-8" : ext switch { ".png" => "image/png", ".jpg" or ".jpeg" => "image/jpeg", ".webp" => "image/webp", ".gif" => "image/gif", ".pdf" => "application/pdf", _ => "application/octet-stream" };
-    if (ext is ".html" or ".htm") context.Response.Headers.ContentSecurityPolicy = "sandbox allow-scripts allow-forms; default-src data: blob: 'unsafe-inline' 'unsafe-eval'; img-src data: blob:; style-src data: blob: 'unsafe-inline'; font-src data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
-    return Results.File(path, contentType, enableRangeProcessing: true);
+    return ServeAsset(context, storedName);
 });
 app.MapPost("/api/import-json", async (HttpRequest request, IFormFile file) =>
 {
@@ -745,3 +934,31 @@ static string ReadString(JsonElement element, string name) =>
     FindProperty(element, name) is { ValueKind: JsonValueKind.String } value ? value.GetString() ?? "" : "";
 
 app.Run();
+
+static Dictionary<string, WebUser> LoadWebUsers(string path)
+{
+    if (!File.Exists(path)) return new(StringComparer.OrdinalIgnoreCase);
+    var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+    var document = JsonDocument.Parse(File.ReadAllText(path));
+    var list = document.RootElement.ValueKind == JsonValueKind.Array
+        ? JsonSerializer.Deserialize<List<WebUser>>(document.RootElement.GetRawText(), options) ?? new()
+        : new List<WebUser> { JsonSerializer.Deserialize<WebUser>(document.RootElement.GetRawText(), options)! };
+    return list.Where(user => !string.IsNullOrWhiteSpace(user.Username) && !string.IsNullOrWhiteSpace(user.PasswordHash))
+        .ToDictionary(user => user.Username, StringComparer.OrdinalIgnoreCase);
+}
+
+static bool VerifyPassword(string password, string encoded)
+{
+    var parts = encoded.Split('$');
+    if (parts.Length != 4 || parts[0] != "pbkdf2-sha256" || !int.TryParse(parts[1], out var iterations) || iterations < 100_000 || iterations > 2_000_000) return false;
+    try
+    {
+        var salt = Convert.FromBase64String(parts[2]);
+        var expected = Convert.FromBase64String(parts[3]);
+        var actual = Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations, HashAlgorithmName.SHA256, expected.Length);
+        return CryptographicOperations.FixedTimeEquals(actual, expected);
+    }
+    catch (FormatException) { return false; }
+}
+
+sealed record WebUser(string Username, string PasswordHash);
